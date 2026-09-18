@@ -45,7 +45,7 @@ class FakeAgent implements Agent {
     }
     return {
       events: events(),
-      result: Promise.resolve({ messages: [] as Message[] }),
+      result: Promise.resolve({ agent: name, id: `${name}-result`, messages: [] as Message[] }),
     };
   }
 }
@@ -263,7 +263,7 @@ describe("MultiAgent with LLMPlanner", () => {
       { type: "message_end" },
       { type: "agent_end", agent: "research" },
     ]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ agent: "multi", id: expect.any(String), messages: [] });
     expect(context.conversation.getMessages()).toEqual([
       { role: "user", content: "hello" },
     ]);

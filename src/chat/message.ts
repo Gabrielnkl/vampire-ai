@@ -1,6 +1,6 @@
 export type Role = "system" | "user" | "assistant";
 
 export interface Message {
-  role: Role;
-  content: string;
+  readonly role: Role;
+  readonly content: string;
 }

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { Conversation } from "../src/chat/conversation.js";
 import { MultiAgent } from "../src/agents/multi-agent.js";
+import { SingleAgent } from "../src/agents/single-agent.js";
 import { DeterministicPlanner } from "../src/agents/deterministic-planner.js";
 import type { Planner } from "../src/agents/planner.js";
 import type { AgentName, Plan } from "../src/agents/plan.js";
 import type { AgentDescriptor } from "../src/agents/descriptor.js";
-import type { Message } from "../src/chat/message.js";
+import type { Message, Role } from "../src/chat/message.js";
+import type { LLMClient } from "../src/llm/client.js";
 import type { PlannerInput } from "../src/agents/planner-input.js";
 import type { Agent, AgentRun } from "../src/agents/agent.js";
 import type { AgentContext } from "../src/agents/context.js";
@@ -20,6 +22,8 @@ import type { AgentResult } from "../src/agents/result.js";
  */
 class FakeAgent implements Agent {
   calls: { input: string; context: AgentContext }[] = [];
+  results: AgentResult[] = [];
+  private resultCount = 0;
 
   constructor(
     readonly descriptor: AgentDescriptor,
@@ -32,6 +36,17 @@ class FakeAgent implements Agent {
     const tag = this.tag;
     const name = this.descriptor.name;
     const fail = this.fail;
+    // Deterministic per-fake execution IDs: distinct across runs of the
+    // same fake, stable across test runs (unlike production UUIDs).
+    this.resultCount += 1;
+    const result: AgentResult = fail
+      ? { agent: name, id: `${name}-result-${this.resultCount}`, messages: [] }
+      : {
+          agent: name,
+          id: `${name}-result-${this.resultCount}`,
+          messages: [{ role: "assistant", content: tag }],
+        };
+    this.results.push(result);
     async function* events(): AsyncGenerator<AgentEvent> {
       yield { type: "agent_start", agent: name };
       try {
@@ -48,9 +63,7 @@ class FakeAgent implements Agent {
     }
     return {
       events: events(),
-      result: Promise.resolve(
-        fail ? { messages: [] } : { messages: [{ role: "assistant", content: tag }] },
-      ),
+      result: Promise.resolve(result),
     };
   }
 }
@@ -178,6 +191,8 @@ describe("MultiAgent", () => {
       { type: "agent_end", agent: "coder" },
     ]);
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [{ role: "assistant", content: "CODER" }],
     });
     expect(context.conversation.getMessages()).toEqual([
@@ -225,6 +240,8 @@ describe("MultiAgent", () => {
     const { result } = await collect(agent, context, "both");
 
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [
         { role: "assistant", content: "RESEARCH" },
         { role: "assistant", content: "GENERAL" },
@@ -252,12 +269,62 @@ describe("MultiAgent", () => {
     const coderSeen = children.coder.calls[0]?.context.previousResults ?? [];
     expect(generalSeen).toEqual([]);
     expect(researchSeen).toEqual([
-      { messages: [{ role: "assistant", content: "GENERAL" }] },
+      {
+        agent: "general",
+        id: "general-result-1",
+        messages: [{ role: "assistant", content: "GENERAL" }],
+      },
     ]);
     expect(coderSeen).toEqual([
-      { messages: [{ role: "assistant", content: "GENERAL" }] },
-      { messages: [{ role: "assistant", content: "RESEARCH" }] },
+      {
+        agent: "general",
+        id: "general-result-1",
+        messages: [{ role: "assistant", content: "GENERAL" }],
+      },
+      {
+        agent: "research",
+        id: "research-result-1",
+        messages: [{ role: "assistant", content: "RESEARCH" }],
+      },
     ]);
+  });
+
+  it("distinguishes repeated executions of the same agent by id", async () => {
+    const children = makeAgents();
+    const agent = new MultiAgent(
+      children,
+      new FixedPlanner(["research", "coder", "research"]),
+    );
+    const context = makeContext();
+
+    await collect(agent, context, "again");
+
+    // The second research execution sees the first two settled results…
+    const seen = children.research.calls[1]?.context.previousResults ?? [];
+    expect(seen.map((r) => r.agent)).toEqual(["research", "coder"]);
+    // …while its own settled result carries a fresh id.
+    expect(children.research.results).toHaveLength(2);
+    expect(children.research.results[0]?.id).not.toBe(
+      children.research.results[1]?.id,
+    );
+    expect(seen[0]).toBe(children.research.results[0]);
+  });
+
+  it("passes the identical child result object into previousResults", async () => {
+    const children = makeAgents();
+    const agent = new MultiAgent(
+      children,
+      new FixedPlanner(["general", "research"]),
+    );
+    const context = makeContext();
+
+    await collect(agent, context, "chain");
+
+    // No copying, no reconstruction: the exact settled object flows through.
+    expect(children.research.calls[0]?.context.previousResults[0]).toBe(
+      children.general.results[0],
+    );
+    expect(children.research.calls[0]?.context.previousResults).toHaveLength(1);
   });
 
   it("isolates previousResults snapshots between children at runtime", async () => {
@@ -267,11 +334,12 @@ describe("MultiAgent", () => {
       run(_input: string, childContext: AgentContext): AgentRun {
         seen.push(childContext.previousResults.map((r) => ({ ...r })));
         // Deliberate cast: simulates a malicious/buggy JS child bypassing
-        // the readonly types. Array-level attacks must not leak across
-        // siblings; result objects themselves stay shared by convention.
+        // the readonly types. Array-level attacks hit only the child's own
+        // snapshot array (see the element-level freezing test below for
+        // attacks on the result objects themselves).
         const writable = childContext.previousResults as AgentResult[];
-        writable.push({ messages: [{ role: "assistant", content: "fake" }] });
-        writable[0] = { messages: [{ role: "assistant", content: "fake" }] };
+        writable.push({ agent: "fake", id: "fake-1", messages: [{ role: "assistant", content: "fake" }] });
+        writable[0] = { agent: "fake", id: "fake-1", messages: [{ role: "assistant", content: "fake" }] };
         async function* events(): AsyncGenerator<AgentEvent> {
           yield { type: "agent_start", agent: "research" };
           yield { type: "message_start", role: "assistant" };
@@ -282,6 +350,8 @@ describe("MultiAgent", () => {
         return {
           events: events(),
           result: Promise.resolve({
+            agent: "research",
+            id: "research-result-9",
             messages: [{ role: "assistant", content: "RESEARCH" }],
           }),
         };
@@ -300,13 +370,115 @@ describe("MultiAgent", () => {
     // array. Coder still sees the pristine sequence.
     expect(seen).toHaveLength(1);
     expect(children.coder.calls[0]?.context.previousResults).toEqual([
-      { messages: [{ role: "assistant", content: "GENERAL" }] },
-      { messages: [{ role: "assistant", content: "RESEARCH" }] },
+      {
+        agent: "general",
+        id: "general-result-1",
+        messages: [{ role: "assistant", content: "GENERAL" }],
+      },
+      {
+        agent: "research",
+        id: "research-result-9",
+        messages: [{ role: "assistant", content: "RESEARCH" }],
+      },
     ]);
     // Root publication used settled results, never the corrupted array.
     expect(context.conversation.getMessages()).toEqual([
       { role: "user", content: "chain" },
       { role: "assistant", content: "GENERAL" },
+      { role: "assistant", content: "RESEARCH" },
+      { role: "assistant", content: "CODER" },
+    ]);
+  });
+
+  it("freezes settled results against element-level mutation", async () => {
+    const llm: LLMClient = {
+      async *stream(_messages: Message[]): AsyncGenerator<string> {
+        yield "A-OUTPUT";
+      },
+      async complete(): Promise<string> {
+        return Promise.reject(new Error("unused"));
+      },
+    };
+    const attempts: string[] = [];
+    const seen: AgentResult[][] = [];
+    const malicious: Agent = {
+      descriptor: RESEARCH_DESCRIPTOR,
+      run(_input: string, childContext: AgentContext): AgentRun {
+        // Deliberate casts: attack the RECEIVED result object itself, not
+        // just the array. Production results are frozen at settle time, so
+        // this either throws (strict mode) or silently no-ops — either way
+        // observable state must stay pristine.
+        const received = childContext.previousResults[0] as unknown as {
+          messages: { role: string; content: string }[];
+          agent: string;
+        };
+        try {
+          received.messages.push({
+            role: "assistant",
+            content: "injected",
+          });
+          attempts.push("push");
+        } catch {
+          attempts.push("push-threw");
+        }
+        try {
+          received.messages[0]!.content = "corrupted";
+          attempts.push("write");
+        } catch {
+          attempts.push("write-threw");
+        }
+        try {
+          received.agent = "corrupted";
+          attempts.push("rename");
+        } catch {
+          attempts.push("rename-threw");
+        }
+        async function* events(): AsyncGenerator<AgentEvent> {
+          yield { type: "agent_start", agent: "research" };
+          yield { type: "message_start", role: "assistant" };
+          yield { type: "text_delta", text: "RESEARCH" };
+          yield { type: "message_end" };
+          yield { type: "agent_end", agent: "research" };
+        }
+        return {
+          events: events(),
+          result: Promise.resolve({
+            agent: "research",
+            id: "research-result-9",
+            messages: [{ role: "assistant", content: "RESEARCH" }],
+          }),
+        };
+      },
+    };
+    const children = makeAgents();
+    // Real SingleAgent produces A through the production freezing path.
+    const producer = new SingleAgent(llm, GENERAL_DESCRIPTOR);
+    const agent = new MultiAgent(
+      { general: producer, research: malicious, coder: children.coder },
+      new FixedPlanner(["general", "research", "coder"]),
+    );
+    const context = makeContext();
+
+    await collect(agent, context, "chain");
+
+    // Both attacks were attempted.
+    expect(attempts).toHaveLength(3);
+    // Coder still sees A's original result; root publication is intact.
+    expect(children.coder.calls[0]?.context.previousResults).toEqual([
+      {
+        agent: "general",
+        id: expect.any(String),
+        messages: [{ role: "assistant", content: "A-OUTPUT" }],
+      },
+      {
+        agent: "research",
+        id: "research-result-9",
+        messages: [{ role: "assistant", content: "RESEARCH" }],
+      },
+    ]);
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "chain" },
+      { role: "assistant", content: "A-OUTPUT" },
       { role: "assistant", content: "RESEARCH" },
       { role: "assistant", content: "CODER" },
     ]);
@@ -327,6 +499,8 @@ describe("MultiAgent", () => {
         return {
           events: events(),
           result: Promise.resolve({
+            agent: "general",
+            id: "general-diverged-1",
             messages: [{ role: "assistant", content: "published result" }],
           }),
         };
@@ -342,7 +516,7 @@ describe("MultiAgent", () => {
           yield { type: "message_end" };
           yield { type: "agent_end", agent: "research" };
         }
-        return { events: events(), result: Promise.resolve({ messages: [] }) };
+        return { events: events(), result: Promise.resolve({ agent: "research", id: "research-recording-1", messages: [] }) };
       },
     };
     const children = makeAgents();
@@ -355,7 +529,13 @@ describe("MultiAgent", () => {
     await collect(agent, context, "go");
 
     expect(seen).toEqual([
-      [{ messages: [{ role: "assistant", content: "published result" }] }],
+      [
+        {
+          agent: "general",
+          id: "general-diverged-1",
+          messages: [{ role: "assistant", content: "published result" }],
+        },
+      ],
     ]);
   });
 
@@ -371,7 +551,7 @@ describe("MultiAgent", () => {
           yield { type: "message_end" };
           yield { type: "agent_end", agent: "coder" };
         }
-        return { events: events(), result: Promise.resolve({ messages: [] }) };
+        return { events: events(), result: Promise.resolve({ agent: "coder", id: "coder-recording-1", messages: [] }) };
       },
     };
     const children = makeAgents();
@@ -392,12 +572,18 @@ describe("MultiAgent", () => {
     // (`seen` non-empty proves the coder child ran after the failure.)
     expect(seen).toEqual([
       [
-        { messages: [{ role: "assistant", content: "GENERAL" }] },
-        { messages: [] },
+        {
+          agent: "general",
+          id: "general-result-1",
+          messages: [{ role: "assistant", content: "GENERAL" }],
+        },
+        { agent: "research", id: "research-result-1", messages: [] },
       ],
     ]);
     expect(events.some((e) => e.type === "message_end")).toBe(true);
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [{ role: "assistant", content: "GENERAL" }],
     });
     expect(context.conversation.getMessages()).toEqual([
@@ -423,6 +609,8 @@ describe("MultiAgent", () => {
       { type: "agent_start", agent: "research" },
     ]);
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [
         { role: "assistant", content: "RESEARCH" },
         { role: "assistant", content: "RESEARCH" },
@@ -452,7 +640,7 @@ describe("MultiAgent", () => {
     expect(events).toEqual([
       { type: "error", error: new Error('Unknown agent: "does-not-exist"') },
     ]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ id: expect.any(String), agent: "multi", messages: [] });
     expect(context.conversation.getMessages()).toEqual([
       { role: "user", content: "hello" },
     ]);
@@ -471,7 +659,7 @@ describe("MultiAgent", () => {
     expect(events).toEqual([
       { type: "error", error: new Error("Invalid plan: no agents selected") },
     ]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ id: expect.any(String), agent: "multi", messages: [] });
     expect(context.conversation.getMessages()).toEqual([]);
   });
 
@@ -503,6 +691,8 @@ describe("MultiAgent", () => {
       "agent_end",
     ]);
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [{ role: "assistant", content: "GENERAL" }],
     });
     expect(context.conversation.getMessages()).toEqual([
@@ -611,7 +801,7 @@ describe("MultiAgent", () => {
           yield { type: "message_end" };
           yield { type: "agent_end", agent: "general" };
         }
-        return { events: events(), result: Promise.resolve({ messages: [] }) };
+        return { events: events(), result: Promise.resolve({ agent: "general", id: "general-recording-1", messages: [] }) };
       },
     };
     const agent = new MultiAgent(
@@ -693,7 +883,7 @@ describe("MultiAgent", () => {
         async function* events(): AsyncGenerator<AgentEvent> {
           yield* childEvents;
         }
-        return { events: events(), result: Promise.resolve({ messages: [] }) };
+        return { events: events(), result: Promise.resolve({ agent: "general", id: "general-recording-2", messages: [] }) };
       },
     };
     const agent = new MultiAgent(
@@ -719,7 +909,7 @@ describe("MultiAgent", () => {
           yield { type: "error", error: failure };
           yield { type: "agent_end", agent: "general" };
         }
-        return { events: events(), result: Promise.resolve({ messages: [] }) };
+        return { events: events(), result: Promise.resolve({ agent: "general", id: "general-recording-3", messages: [] }) };
       },
     };
     const agent = new MultiAgent(
@@ -756,6 +946,8 @@ describe("MultiAgent", () => {
         return {
           events: events(),
           result: Promise.resolve({
+            agent: "research",
+            id: "research-diverged-1",
             messages: [{ role: "assistant", content: "published result" }],
           }),
         };
@@ -794,6 +986,8 @@ describe("MultiAgent", () => {
 
     // MultiAgent's own result mirrors what was published.
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [{ role: "assistant", content: "published result" }],
     });
   });
@@ -820,6 +1014,8 @@ describe("MultiAgent", () => {
     const result = await run.result;
 
     expect(result).toEqual({
+      id: expect.any(String),
+      agent: "multi",
       messages: [{ role: "assistant", content: "GENERAL" }],
     });
     expect(children.general.calls).toHaveLength(1);
@@ -907,7 +1103,7 @@ describe("MultiAgent", () => {
         // Deliberate cast: simulates a malicious/buggy JS planner bypassing
         // the readonly types. Runtime snapshot copies must still protect
         // canonical state.
-        const messages = input.messages as Message[];
+        const messages = input.messages as { role: Role; content: string }[];
         messages.push({ role: "user", content: "injected" });
         messages[0]!.content = "corrupted";
         return Promise.resolve({ agents: ["general"] });
@@ -944,7 +1140,7 @@ describe("MultiAgent", () => {
     expect(children.general.calls).toHaveLength(0);
     expect(children.research.calls).toHaveLength(0);
     expect(events).toEqual([{ type: "error", error: new Error("no plan") }]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ id: expect.any(String), agent: "multi", messages: [] });
     expect(context.conversation.getMessages()).toEqual([]);
   });
 
@@ -1000,10 +1196,421 @@ describe("MultiAgent", () => {
     expect(events).toEqual([
       { type: "error", error: new Error('Unknown agent: "does-not-exist"') },
     ]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ id: expect.any(String), agent: "multi", messages: [] });
     // Like any failed turn, the user message is retained with no assistant.
     expect(context.conversation.getMessages()).toEqual([
       { role: "user", content: "hello" },
     ]);
+  });
+
+  it("exposes prior settled results to later real agents without double publication", async () => {
+    const received: Message[][] = [];
+    const scriptedLLM: LLMClient = {
+      async *stream(messages: Message[]): AsyncGenerator<string> {
+        received.push(messages.map((m) => ({ ...m })));
+        yield "done";
+      },
+      async complete(): Promise<string> {
+        return Promise.reject(new Error("unused"));
+      },
+    };
+    const agent = new MultiAgent(
+      {
+        general: new SingleAgent(scriptedLLM, GENERAL_DESCRIPTOR),
+        research: new SingleAgent(scriptedLLM, RESEARCH_DESCRIPTOR),
+        coder: new FakeAgent(CODER_DESCRIPTOR, "CODER"),
+      },
+      new FixedPlanner(["general", "research"]),
+    );
+    const context = makeContext();
+
+    await collect(agent, context, "chain");
+
+    // The second agent's LLM request carries the first agent's settled
+    // result as execution context, on top of the normal conversation.
+    expect(received).toHaveLength(2);
+    expect(received[1]).toEqual([
+      { role: "user", content: "chain" },
+      {
+        role: "system",
+        content:
+          "Previous agent results (runtime execution context, not conversation history):\n" +
+          "[Result 1 \u2014 general]\ndone",
+      },
+    ]);
+    // Root holds exactly one message per completed agent — the context
+    // message never becomes history.
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "chain" },
+      { role: "assistant", content: "done" },
+      { role: "assistant", content: "done" },
+    ]);
+  });
+
+  it("gives the next agent the authoritative result, not streamed text", async () => {
+    const received: Message[][] = [];
+    const scriptedLLM: LLMClient = {
+      async *stream(messages: Message[]): AsyncGenerator<string> {
+        received.push(messages.map((m) => ({ ...m })));
+        yield "done";
+      },
+      async complete(): Promise<string> {
+        return Promise.reject(new Error("unused"));
+      },
+    };
+    const diverging: Agent = {
+      descriptor: GENERAL_DESCRIPTOR,
+      run(): AgentRun {
+        async function* events(): AsyncGenerator<AgentEvent> {
+          yield { type: "agent_start", agent: "general" };
+          yield { type: "message_start", role: "assistant" };
+          yield { type: "text_delta", text: "streamed UI text" };
+          yield { type: "message_end" };
+          yield { type: "agent_end", agent: "general" };
+        }
+        return {
+          events: events(),
+          result: Promise.resolve({
+            agent: "general",
+            id: "general-diverged-1",
+            messages: [{ role: "assistant", content: "published result" }],
+          }),
+        };
+      },
+    };
+    const agent = new MultiAgent(
+      {
+        general: diverging,
+        research: new SingleAgent(scriptedLLM, RESEARCH_DESCRIPTOR),
+        coder: new FakeAgent(CODER_DESCRIPTOR, "CODER"),
+      },
+      new FixedPlanner(["general", "research"]),
+    );
+    const context = makeContext();
+
+    await collect(agent, context, "go");
+
+    // previousResults comes from AgentRun.result, never from text_delta.
+    expect(received).toHaveLength(1);
+    expect(received[0]).toEqual([
+      { role: "user", content: "go" },
+      {
+        role: "system",
+        content:
+          "Previous agent results (runtime execution context, not conversation history):\n" +
+          "[Result 1 \u2014 general]\npublished result",
+      },
+    ]);
+  });
+});
+
+describe("result lineage", () => {
+  function trackLLM() {
+    const received: Message[][] = [];
+    const llm: LLMClient = {
+      async *stream(messages: Message[]): AsyncGenerator<string> {
+        received.push(messages.map((m) => ({ ...m })));
+        yield `output-${received.length}`;
+      },
+      async complete(): Promise<string> {
+        return Promise.reject(new Error("unused"));
+      },
+    };
+    return { llm, received };
+  }
+
+  function lineageAgents(llm: LLMClient) {
+    return {
+      general: new SingleAgent(llm, GENERAL_DESCRIPTOR),
+      research: new SingleAgent(llm, RESEARCH_DESCRIPTOR),
+      coder: new SingleAgent(llm, CODER_DESCRIPTOR),
+    };
+  }
+
+  async function runChain() {
+    const { llm } = trackLLM();
+    const agent = new MultiAgent(
+      lineageAgents(llm),
+      new FixedPlanner(["research", "coder", "research"]),
+    );
+    const context = makeContext();
+    const run = agent.run("chain", context);
+    const events: AgentEvent[] = [];
+    for await (const event of run.events) {
+      events.push(event);
+    }
+    return { context, result: await run.result };
+  }
+
+  it("keeps three distinct identities across research → coder → research", async () => {
+    const { context } = await runChain();
+
+    const [user, ...assistant] = context.conversation.getMessages();
+    expect(user).toEqual({ role: "user", content: "chain" });
+    expect(assistant.map((m) => m.content)).toEqual([
+      "output-1",
+      "output-2",
+      "output-3",
+    ]);
+  });
+
+  it("flows exact result objects through previousResults in order", async () => {
+    const { llm } = trackLLM();
+    const seen: AgentResult[][] = [];
+    const settled: AgentResult[] = [];
+    const inner = new SingleAgent(llm, RESEARCH_DESCRIPTOR);
+    // Delegating recorder: transparently runs the real agent while
+    // capturing both what it saw and what it settled.
+    const recordingResearch: Agent = {
+      descriptor: RESEARCH_DESCRIPTOR,
+      run(input: string, childContext: AgentContext): AgentRun {
+        seen.push([...childContext.previousResults]);
+        const innerRun = inner.run(input, childContext);
+        void innerRun.result.then((result) => {
+          settled.push(result);
+        });
+        return innerRun;
+      },
+    };
+    const agent = new MultiAgent(
+      {
+        general: new SingleAgent(llm, GENERAL_DESCRIPTOR),
+        research: recordingResearch,
+        coder: new SingleAgent(llm, CODER_DESCRIPTOR),
+      },
+      new FixedPlanner(["research", "coder", "research"]),
+    );
+    const context = makeContext();
+
+    const run = agent.run("chain", context);
+    for await (const _event of run.events) {
+      // Drain.
+    }
+    await run.result;
+
+    // research₂ saw the two settled predecessors, in execution order…
+    expect(seen).toHaveLength(2);
+    expect(seen[1]?.map((r) => r.agent)).toEqual(["research", "coder"]);
+    expect(seen[1]?.[0]?.id).not.toBe(seen[1]?.[1]?.id);
+    // …as the identical objects the producers settled (not copies).
+    expect(seen[1]?.[0]).toBe(settled[0]);
+    expect(seen[1]?.[0]?.messages.map((m) => m.content)).toEqual(["output-1"]);
+    expect(seen[1]?.[1]?.messages.map((m) => m.content)).toEqual(["output-2"]);
+  });
+
+  it("keeps execution IDs out of the model-facing context", async () => {
+    const { llm, received } = trackLLM();
+    const agent = new MultiAgent(
+      lineageAgents(llm),
+      new FixedPlanner(["research", "coder", "research"]),
+    );
+    const context = makeContext();
+
+    const run = agent.run("chain", context);
+    for await (const _event of run.events) {
+      // Drain.
+    }
+    await run.result;
+
+    const systemTexts = received
+      .flat()
+      .filter((m) => m.role === "system")
+      .map((m) => m.content);
+    expect(systemTexts.length).toBeGreaterThan(0);
+    for (const text of systemTexts) {
+      expect(text).toContain("[Result 1 — research]");
+      expect(text).not.toMatch(
+        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+      );
+    }
+  });
+
+  it("keeps root history free of execution metadata", async () => {
+    const { context } = await runChain();
+
+    for (const message of context.conversation.getMessages()) {
+      expect(message).toEqual({
+        role: expect.stringMatching(/^(system|user|assistant)$/),
+        content: expect.any(String),
+      });
+      expect(message.content).not.toContain("[Result");
+    }
+  });
+
+  it("does not let consumption become ownership in a malicious child", async () => {
+    const attacker: Agent = {
+      descriptor: CODER_DESCRIPTOR,
+      run(_input: string, childContext: AgentContext): AgentRun {
+        // Sees research's result…
+        const stolen = childContext.previousResults[0] as AgentResult;
+        async function* events(): AsyncGenerator<AgentEvent> {
+          yield { type: "agent_start", agent: "coder" };
+          yield { type: "message_start", role: "assistant" };
+          // …may legitimately mention it in generated content…
+          yield { type: "text_delta", text: `echo ${stolen.messages[0]?.content}` };
+          yield { type: "message_end" };
+          yield { type: "agent_end", agent: "coder" };
+        }
+        // …but settles only its own output: the runtime never copies the
+        // consumed result into the producer's result for it.
+        return {
+          events: events(),
+          result: Promise.resolve({
+            agent: "coder",
+            id: "coder-attacker-1",
+            messages: [{ role: "assistant", content: "echo output-1" }],
+          }),
+        };
+      },
+    };
+    const { llm, received } = trackLLM();
+    const agent = new MultiAgent(
+      {
+        general: new SingleAgent(llm, GENERAL_DESCRIPTOR),
+        research: new SingleAgent(llm, RESEARCH_DESCRIPTOR),
+        coder: attacker,
+      },
+      new FixedPlanner(["research", "coder"]),
+    );
+    const context = makeContext();
+
+    const run = agent.run("chain", context);
+    for await (const _event of run.events) {
+      // Drain.
+    }
+    const result = await run.result;
+
+    expect(result.messages).toEqual([
+      { role: "assistant", content: "output-1" },
+      { role: "assistant", content: "echo output-1" },
+    ]);
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "chain" },
+      { role: "assistant", content: "output-1" },
+      { role: "assistant", content: "echo output-1" },
+    ]);
+  });
+});
+describe("delegation passivity", () => {
+  const scriptedLLM: LLMClient = {
+    async *stream(_messages: Message[]): AsyncGenerator<string> {
+      // No output: keeps the turn's results empty so assertions stay focused.
+    },
+    async complete(): Promise<string> {
+      return Promise.reject(new Error("unused"));
+    },
+  };
+
+  function delegatingGeneral(
+    requests: { agent: string; input: string }[],
+  ): SingleAgent {
+    return new SingleAgent(scriptedLLM, GENERAL_DESCRIPTOR, requests);
+  }
+
+  it("executes a delegated request inline during the requesting execution", async () => {
+    const children = makeAgents();
+    const agent = new MultiAgent(
+      {
+        ...children,
+        general: delegatingGeneral([
+          { agent: "research", input: "investigate this topic" },
+        ]),
+      },
+      new FixedPlanner(["general"]),
+    );
+    const context = makeContext();
+
+    const { events, result } = await collect(agent, context, "go");
+
+    // The request travels through MultiAgent to the consumer, and the
+    // delegated bracket nests inline before general's own message events.
+    expect(events).toEqual([
+      { type: "agent_start", agent: "general" },
+      {
+        type: "delegation_request",
+        request: { agent: "research", input: "investigate this topic" },
+      },
+      { type: "agent_start", agent: "research" },
+      { type: "message_start", role: "assistant" },
+      { type: "text_delta", text: "RESEARCH" },
+      { type: "message_end" },
+      { type: "agent_end", agent: "research" },
+      { type: "message_start", role: "assistant" },
+      { type: "message_end" },
+      { type: "agent_end", agent: "general" },
+    ]);
+    expect(children.research.calls).toHaveLength(1);
+    expect(children.research.calls[0]?.input).toBe("investigate this topic");
+    expect(children.coder.calls).toHaveLength(0);
+    expect(result.messages).toEqual([
+      { role: "assistant", content: "RESEARCH" },
+    ]);
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "go" },
+      { role: "assistant", content: "RESEARCH" },
+    ]);
+  });
+
+  it("forwards the identical request object", async () => {
+    const general = delegatingGeneral([
+      { agent: "research", input: "investigate this topic" },
+    ]);
+    const children = makeAgents();
+
+    // Capture the object the producer emits on a direct run.
+    let directRequest;
+    const direct = general.run("go", makeContext());
+    for await (const event of direct.events) {
+      if (event.type === "delegation_request") {
+        directRequest = event.request;
+      }
+    }
+    await direct.result;
+
+    const agent = new MultiAgent(
+      { ...children, general },
+      new FixedPlanner(["general"]),
+    );
+    const { events } = await collect(agent, makeContext(), "go");
+
+    const forwarded = events.find((e) => e.type === "delegation_request");
+    expect(forwarded).toBeDefined();
+    if (forwarded?.type !== "delegation_request") {
+      throw new Error("unreachable");
+    }
+    // Same reference end to end: MultiAgent neither copies nor rebuilds it.
+    expect(forwarded.request).toBe(directRequest);
+  });
+
+  it("executes only the first of several delegation requests", async () => {
+    const children = makeAgents();
+    const agent = new MultiAgent(
+      {
+        ...children,
+        general: delegatingGeneral([
+          { agent: "research", input: "r1" },
+          { agent: "coder", input: "c1" },
+          { agent: "research", input: "r2" },
+        ]),
+      },
+      new FixedPlanner(["general"]),
+    );
+
+    const { events } = await collect(agent, makeContext(), "go");
+
+    // All requests stay observable, but only the first executes; the rest
+    // are rejected as errors rather than scheduled.
+    expect(events.filter((e) => e.type === "delegation_request")).toEqual([
+      { type: "delegation_request", request: { agent: "research", input: "r1" } },
+      { type: "delegation_request", request: { agent: "coder", input: "c1" } },
+      { type: "delegation_request", request: { agent: "research", input: "r2" } },
+    ]);
+    expect(children.research.calls).toHaveLength(1);
+    expect(children.research.calls[0]?.input).toBe("r1");
+    expect(children.coder.calls).toHaveLength(0);
+    expect(events).toContainEqual({
+      type: "error",
+      error: new Error("Only one delegation per execution is supported"),
+    });
   });
 });

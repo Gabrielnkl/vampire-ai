@@ -7,6 +7,7 @@ import type { Message } from "../src/chat/message.js";
 import type { LLMClient } from "../src/llm/client.js";
 import type { AgentEvent } from "../src/agents/events.js";
 import type { AgentResult } from "../src/agents/result.js";
+import { freezeResult } from "../src/agents/result.js";
 
 class FakeLLM implements LLMClient {
   received: Message[][] = [];
@@ -88,6 +89,8 @@ describe("SingleAgent events", () => {
 
     // Result publishes the accumulated assistant message.
     expect(result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "Hello world!" }],
     });
   });
@@ -110,6 +113,8 @@ describe("SingleAgent events", () => {
     expect(events[0]).toEqual({ type: "agent_start", agent: "general" });
     expect(events.at(-1)).toEqual({ type: "agent_end", agent: "general" });
     expect(result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "ok" }],
     });
   });
@@ -145,9 +150,13 @@ describe("SingleAgent events", () => {
       { role: "assistant", content: "second!" },
     ]);
     expect(first.result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "first!" }],
     });
     expect(second.result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "second!" }],
     });
   });
@@ -175,7 +184,7 @@ describe("SingleAgent events", () => {
     ]);
 
     // Partial streamed output is not a published result.
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ agent: "general", id: expect.any(String), messages: [] });
   });
 
   it("emits the full lifecycle with no deltas and stores nothing for an empty response", async () => {
@@ -193,7 +202,7 @@ describe("SingleAgent events", () => {
     expect(context.conversation.getMessages()).toEqual([
       { role: "user", content: "Hi" },
     ]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ agent: "general", id: expect.any(String), messages: [] });
   });
 
   it("treats empty user input as a no-op with no events", async () => {
@@ -204,7 +213,7 @@ describe("SingleAgent events", () => {
     const { events, result } = await collect(agent, context, "   ");
 
     expect(events).toEqual([]);
-    expect(result).toEqual({ messages: [] });
+    expect(result).toEqual({ agent: "general", id: expect.any(String), messages: [] });
     expect(llm.received).toHaveLength(0);
     expect(context.conversation.getMessages()).toEqual([]);
   });
@@ -236,6 +245,8 @@ describe("SingleAgent events", () => {
     const result = await run.result;
 
     expect(result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "Hello world" }],
     });
     expect(llm.received).toHaveLength(1);
@@ -271,6 +282,8 @@ describe("SingleAgent events", () => {
       { type: "agent_end", agent: "general" },
     ]);
     expect(result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "Hello" }],
     });
     expect(context.conversation.getMessages()).toEqual([
@@ -292,6 +305,8 @@ describe("SingleAgent events", () => {
     }
 
     expect(result).toEqual({
+      agent: "general",
+      id: expect.any(String),
       messages: [{ role: "assistant", content: "late" }],
     });
     expect(events).toEqual([
@@ -301,5 +316,192 @@ describe("SingleAgent events", () => {
       { type: "message_end" },
       { type: "agent_end", agent: "general" },
     ]);
+  });
+});
+
+describe("SingleAgent result identity", () => {
+  const descriptor = { name: "general", description: "General test agent." };
+
+  it("mints a distinct id per run of the same agent", async () => {
+    const agent = new SingleAgent(new FakeLLM(["ok"]), descriptor);
+
+    const first = await collect(agent, makeContext(), "one");
+    const second = await collect(agent, makeContext(), "two");
+
+    expect(first.result.agent).toBe("general");
+    expect(second.result.agent).toBe("general");
+    expect(typeof first.result.id).toBe("string");
+    expect(first.result.id.length).toBeGreaterThan(0);
+    expect(second.result.id.length).toBeGreaterThan(0);
+    expect(first.result.id).not.toBe(second.result.id);
+  });
+
+  it("mints distinct ids for empty results", async () => {
+    const agent = new SingleAgent(new FakeLLM([]), descriptor);
+
+    const first = await collect(agent, makeContext(), "one");
+    const second = await collect(agent, makeContext(), "two");
+
+    expect(first.result).toEqual({ agent: "general", id: expect.any(String), messages: [] });
+    expect(first.result.id.length).toBeGreaterThan(0);
+    expect(first.result.id).not.toBe(second.result.id);
+  });
+
+  it("mints distinct ids for failed results without changing failure semantics", async () => {
+    const agent = new SingleAgent(new FailingLLM(), descriptor);
+
+    const first = await collect(agent, makeContext(), "one");
+    const second = await collect(agent, makeContext(), "two");
+
+    for (const run of [first, second]) {
+      expect(run.result).toEqual({ agent: "general", id: expect.any(String), messages: [] });
+      expect(run.events.some((e) => e.type === "message_end")).toBe(false);
+    }
+    expect(first.result.id).not.toBe(second.result.id);
+  });
+});
+
+describe("SingleAgent previousResults", () => {
+  const descriptor = { name: "general", description: "General test agent." };
+
+  it("sends the unchanged request when there are no previous results", async () => {
+    const context = makeContext();
+    const llm = new FakeLLM(["ok"]);
+    const agent = new SingleAgent(llm, descriptor);
+
+    await collect(agent, context, "Hi");
+
+    expect(llm.received).toEqual([[{ role: "user", content: "Hi" }]]);
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "Hi" },
+      { role: "assistant", content: "ok" },
+    ]);
+  });
+
+  it("appends one previous result as explicit execution context", async () => {
+    const context: AgentContext = {
+      conversation: new Conversation(),
+      previousResults: [
+        freezeResult("prev-1", "general", [{ role: "assistant", content: "prior answer" }]),
+      ],
+    };
+    const llm = new FakeLLM(["ok"]);
+    const agent = new SingleAgent(llm, descriptor);
+
+    await collect(agent, context, "Hi");
+
+    expect(llm.received).toEqual([
+      [
+        { role: "user", content: "Hi" },
+        {
+          role: "system",
+          content:
+            "Previous agent results (runtime execution context, not conversation history):\n" +
+            "[Result 1 \u2014 general]\nprior answer",
+        },
+      ],
+    ]);
+    // The context message is request-only: canonical history is untouched.
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "Hi" },
+      { role: "assistant", content: "ok" },
+    ]);
+  });
+
+  it("preserves the order of multiple previous results", async () => {
+    const context: AgentContext = {
+      conversation: new Conversation(),
+      previousResults: [
+        freezeResult("prev-1", "general", [{ role: "assistant", content: "first" }]),
+        freezeResult("prev-2", "general", [{ role: "assistant", content: "second" }]),
+        freezeResult("prev-3", "general", [{ role: "assistant", content: "third" }]),
+      ],
+    };
+    const llm = new FakeLLM(["ok"]);
+    const agent = new SingleAgent(llm, descriptor);
+
+    await collect(agent, context, "Hi");
+
+    expect(llm.received).toHaveLength(1);
+    expect(llm.received[0]?.at(-1)).toEqual({
+      role: "system",
+      content:
+        "Previous agent results (runtime execution context, not conversation history):\n" +
+        "[Result 1 \u2014 general]\nfirst\n\n[Result 2 \u2014 general]\nsecond\n\n[Result 3 \u2014 general]\nthird",
+    });
+  });
+
+  it("reads previousResults without mutating them", async () => {
+    const previous = freezeResult("prev-1", "general", [{ role: "assistant", content: "prior" }]);
+    const context: AgentContext = {
+      conversation: new Conversation(),
+      previousResults: [previous],
+    };
+    const agent = new SingleAgent(new FakeLLM(["ok"]), descriptor);
+
+    await collect(agent, context, "Hi");
+
+    expect(context.previousResults).toEqual([
+      {
+        agent: "general",
+        id: "prev-1",
+        messages: [{ role: "assistant", content: "prior" }],
+      },
+    ]);
+  });
+});
+
+describe("SingleAgent delegation requests", () => {
+  const descriptor = { name: "general", description: "General test agent." };
+
+  function delegatingAgent(chunks: string[]) {
+    return new SingleAgent(new FakeLLM(chunks), descriptor, [
+      { agent: "research", input: "investigate this topic" },
+    ]);
+  }
+
+  it("emits the configured request with exact agent and input", async () => {
+    const { events } = await collect(delegatingAgent([]), makeContext(), "Hi");
+
+    expect(events).toEqual([
+      { type: "agent_start", agent: "general" },
+      {
+        type: "delegation_request",
+        request: { agent: "research", input: "investigate this topic" },
+      },
+      { type: "message_start", role: "assistant" },
+      { type: "message_end" },
+      { type: "agent_end", agent: "general" },
+    ]);
+  });
+
+  it("keeps the request out of the result and the conversation", async () => {
+    const context = makeContext();
+
+    const { result } = await collect(delegatingAgent([]), context, "Hi");
+
+    expect(result.messages).toEqual([]);
+    expect(result.agent).toBe("general");
+    expect(context.conversation.getMessages()).toEqual([
+      { role: "user", content: "Hi" },
+    ]);
+  });
+
+  it("keeps ordinary assistant prose as text deltas, not requests", async () => {
+    const agent = new SingleAgent(
+      new FakeLLM(["please delegate to research"]),
+      descriptor,
+    );
+
+    const { events } = await collect(agent, makeContext(), "Hi");
+
+    expect(events).toEqual([
+      { type: "agent_start", agent: "general" },
+      { type: "message_start", role: "assistant" },
+      { type: "text_delta", text: "please delegate to research" },
+      { type: "message_end" },
+      { type: "agent_end", agent: "general" },
+    ]);
+    expect(events.some((e) => e.type === "delegation_request")).toBe(false);
   });
 });

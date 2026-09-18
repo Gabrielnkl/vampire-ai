@@ -37,7 +37,10 @@ planned child (`forkContext`):
 each child works on its own isolated `Conversation` copy plus a fresh
 snapshot of the settled results completed earlier in the plan
 (`previousResults`, one-way and read-only — children cannot reach each
-other) while the root conversation stays canonical — MultiAgent records
+other). Each settled result carries a stable per-execution `id` alongside
+its producer `agent`, so repeated runs of one agent stay distinguishable
+as results flow downstream; consuming a result never makes it part of the
+consumer's own result. While the root conversation stays canonical — MultiAgent records
 the user message up front and appends each completed child's result in
 execution order. A mid-sequence child failure keeps what completed
 children published (no rollback, no fabrication). No automatic merge-back
@@ -58,9 +61,18 @@ of child state. Forwards each child's events unchanged.
 
 Events: `Agent.run()` returns an `AgentRun` with two channels — `events`
 (`AgentEvent`s: `agent_start`/`agent_end` lifecycle brackets around
-`RuntimeEvent` message output) for streaming UI/observability, and a
-separately awaitable `result` (`AgentResult { messages }`) for state
-propagation to the parent. Execution starts eagerly inside `run()` —
+`RuntimeEvent` message output, plus `delegation_request` events an agent
+may emit to name work for another agent — executed inline at most once
+per requesting execution by `MultiAgent` (unknown targets and extras
+surface as `error` events; nested requests stay observable but never
+execute)) for streaming UI/observability, and a
+separately awaitable `result` (`AgentResult { id, agent, messages }`,
+frozen at settle time) for state propagation to the parent. `result.id` is
+a fresh UUID per execution (so repeated runs never share identity);
+`result.agent` is the producing agent's own descriptor name — descriptive
+metadata, never a routing instruction. Later sequential children receive settled results as
+read-only `previousResults`, rendered into their LLM request as labeled
+context (`[Result 1 — general]`). Execution starts eagerly inside `run()` —
 exactly once per call — so `result` settles on completion whether or not
 anyone drains `events`, and late event consumers replay a local buffer.
 `agent_end` means "execution ended", not "it

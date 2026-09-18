@@ -31,7 +31,9 @@ describe("Conversation", () => {
 
     const messages = convo.getMessages();
     messages.push({ role: "user", content: "Hacked" });
-    messages[0]!.content = "Mutated";
+    // Deliberate cast: proves runtime snapshot isolation against JS-level
+    // mutation, which readonly types alone cannot stop.
+    (messages[0] as { content: string }).content = "Mutated";
 
     expect(convo.getMessages()).toEqual([
       { role: "user", content: "Hello" },
