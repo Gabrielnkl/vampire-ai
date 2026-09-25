@@ -4,6 +4,8 @@ import { Box, Text, useApp } from "ink";
 import TextInput from "ink-text-input";
 import type { Message } from "../chat/message.js";
 import type { AgentEvent } from "../agents/events.js";
+import { routeSubmit } from "../app/submit.js";
+import type { InvestigationDisplayLine } from "../app/investigation-presentation.js";
 
 interface AppProps {
   /**
@@ -19,6 +21,15 @@ interface AppProps {
    */
   run: (input: string) => AsyncIterable<AgentEvent>;
   initialMessages?: Message[];
+  /**
+   * Application-bound investigation invocation, supplied (like `run`)
+   * by the composition root with all capabilities pre-bound: the TUI
+   * passes the routed request string and appends the returned
+   * `InvestigationDisplayLine`s verbatim. It never constructs goals,
+   * hypotheses, experiments, executors, or configuration, and never
+   * sees investigation-domain types — only these tagged display lines.
+   */
+  runInvestigation: (request: string) => Promise<readonly InvestigationDisplayLine[]>;
 }
 
 /** Display-only message: the producing agent is attached for labeling. */
@@ -30,12 +41,17 @@ function toDisplayMessages(messages: Message[]): DisplayMessage[] {
 
 export default function App({
   run,
+  runInvestigation,
   initialMessages = [],
 }: AppProps): JSX.Element {
   const { exit } = useApp();
   const [messages, setMessages] = useState<DisplayMessage[]>(() =>
     toDisplayMessages(initialMessages),
   );
+  // Investigation conclusions, kept structurally separate from chat
+  // messages so they can never render as assistant output: each line
+  // carries its `kind: "investigation"` tag from formatter to render.
+  const [investigations, setInvestigations] = useState<InvestigationDisplayLine[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
@@ -49,6 +65,36 @@ export default function App({
     }
     if (trimmed === "/exit" || trimmed === "/quit") {
       exit();
+      return;
+    }
+
+    // Application dispatch: investigation requests run outside the
+    // AgentEvent stream and resolve atomically — never as model output.
+    // Ordinary input falls through to the existing chat path untouched.
+    const route = routeSubmit(trimmed);
+    if (route.kind === "investigate") {
+      setInput("");
+      setError(null);
+      setStreaming(true);
+      setStreamingText("");
+      setActiveAgent(null);
+      setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+
+      void (async () => {
+        try {
+          const lines = await runInvestigation(route.request);
+          setInvestigations((prev) => [...prev, ...lines]);
+        } catch (err) {
+          // Application/runtime failure (configuration, LLM, executor
+          // malfunction) — distinct from a `step-failed` investigation
+          // result, which arrives as formatted lines, never here.
+          setError(err instanceof Error ? err.message : String(err));
+        } finally {
+          setStreaming(false);
+          setStreamingText("");
+          setActiveAgent(null);
+        }
+      })();
       return;
     }
 
@@ -154,6 +200,12 @@ export default function App({
                 : `Assistant${m.agent ? ` [${m.agent}]` : ""}: `}
             </Text>
             <Text>{m.content}</Text>
+          </Box>
+        ))}
+        {investigations.map((line, i) => (
+          <Box key={`investigation-${i}`} marginBottom={1}>
+            <Text bold color="magenta">Investigation: </Text>
+            <Text>{line.content}</Text>
           </Box>
         ))}
         {streaming ? (

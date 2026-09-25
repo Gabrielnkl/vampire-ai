@@ -9,6 +9,9 @@ import type { Planner } from "./agents/planner.js";
 import type { AgentContext } from "./agents/context.js";
 import { OpenAIClient } from "./llm/openai-client.js";
 import { loadEnvFile } from "./env.js";
+import { runAppInvestigation } from "./app/investigation.js";
+import { formatInvestigationResult } from "./app/investigation-presentation.js";
+import type { InvestigationDisplayLine } from "./app/investigation-presentation.js";
 import App from "./tui/App.js";
 
 loadEnvFile();
@@ -86,9 +89,31 @@ try {
     planner,
   );
 
+  // Investigation capability, bound here at the composition root like
+  // every other capability: both HTTP probe targets come exclusively
+  // from application configuration (never user text, never model
+  // output), and the loop budget is fixed for interactive use. Targets
+  // are read but not validated here — an absent/invalid value fails
+  // fast inside the executor constructors when (and only when) an
+  // investigation actually runs, so ordinary chat never depends on it.
+  // The TUI receives a callback returning already-formatted
+  // investigation display lines; it never sees domain types.
+  const investigationHttpTarget = (process.env["INVESTIGATION_HTTP_TARGET"] ?? "").trim();
+  const investigationDependencyTarget = (process.env["INVESTIGATION_DEPENDENCY_TARGET"] ?? "").trim();
+  const INVESTIGATION_MAX_STEPS = 5;
+  async function runInvestigation(request: string): Promise<readonly InvestigationDisplayLine[]> {
+    const loopResult = await runAppInvestigation(llm, agent, request, {
+      httpTarget: investigationHttpTarget,
+      dependencyHttpTarget: investigationDependencyTarget,
+      maxSteps: INVESTIGATION_MAX_STEPS,
+    });
+    return formatInvestigationResult(loopResult);
+  }
+
   render(
     <App
       run={(input) => agent.run(input, context).events}
+      runInvestigation={runInvestigation}
       initialMessages={conversation.getMessages()}
     />,
   );
