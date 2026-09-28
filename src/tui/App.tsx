@@ -40,6 +40,7 @@ export default function App({
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
+  const [toolStatus, setToolStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = (value: string): void => {
@@ -57,6 +58,7 @@ export default function App({
     setStreaming(true);
     setStreamingText("");
     setActiveAgent(null);
+    setToolStatus(null);
     setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
 
     // Presentation only: reacts to AgentEvents. The canonical assistant
@@ -95,11 +97,23 @@ export default function App({
               }
               setStreaming(false);
               setStreamingText("");
+              setToolStatus(null);
               break;
             case "error":
               setError(event.error.message);
               setStreaming(false);
               setStreamingText("");
+              setToolStatus(null);
+              break;
+            case "tool_start":
+              setToolStatus(`⚙ ${event.name}`);
+              break;
+            case "tool_end":
+              // Surface failures inline; successes clear the status line.
+              // Recoverable tool errors stay display-only (the run continues).
+              setToolStatus(event.ok ? null : `✗ ${event.name}: ${event.preview}`);
+              break;
+            case "delegation_request":
               break;
           }
         }
@@ -110,6 +124,7 @@ export default function App({
         setStreaming(false);
         setStreamingText("");
         setActiveAgent(null);
+        setToolStatus(null);
       }
     })();
   };
@@ -157,11 +172,14 @@ export default function App({
           </Box>
         ))}
         {streaming ? (
-          <Box marginBottom={1}>
-            <Text bold color="cyan">
-              {`● ${activeAgent ?? "assistant"}: `}
-            </Text>
-            <Text>{streamingText ? streamingText + "▌" : "…"}</Text>
+          <Box marginBottom={1} flexDirection="column">
+            <Box>
+              <Text bold color="cyan">
+                {`● ${activeAgent ?? "assistant"}: `}
+              </Text>
+              <Text>{streamingText ? streamingText + "▌" : "…"}</Text>
+            </Box>
+            {toolStatus ? <Text dimColor>{toolStatus}</Text> : null}
           </Box>
         ) : null}
         {error ? <Text color="red">Error: {error}</Text> : null}
